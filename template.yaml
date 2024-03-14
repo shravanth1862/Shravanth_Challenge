@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates a static HTML website hosted on an EC2 instance.
+
+Parameters:
+  StackName:
+    Type: String
+    Default: StaticWebStack
+    Description: Stack name
+  KeyPair:
+    Type: String
+    Default: dummytestpair
+    Description: Key pair for EC2
+  amiID:
+    Type: String
+    Default: ami-093e79ec1e354151c
+    Description: amiID for EC2
+  CertArn:
+    Type: String
+    Default: arn:aws:acm:us-east-1:890418425978:certificate/8441b711-2d9f-49e8-85f9-ff3137f86a11
+    Description: Signed certificate for HTTPs
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the EC2 instance
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref amiID
+      InstanceType: t2.micro
+      SecurityGroups:
+        - Ref: SecurityGroup
+      KeyName: !Ref KeyPair
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install httpd -y
+          sudo systemctl start httpd
+          sudo systemctl enable httpd
+          sudo echo "<html><head><title>Hello World</title></head><body><h1>Hello World!</h1></body></html>" > /var/www/html/index.html
+          # Install SSL/TLS certificate
+          sudo yum install -y mod_ssl
+          # Fetch ACM certificate data using AWS CLI
+          CERT_DATA=$(aws acm get-certificate --certificate-arn ${CertArn} --query 'Certificate.CertificatePem' --output text)
+          # Write certificate data to file
+          echo "$CERT_DATA" | sudo tee /etc/pki/tls/certs/cert.crt > /dev/null
+          # Restart Apache to apply changes
+          sudo systemctl restart httpd
+
+  CheckInstanceStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          StackName: !Ref StackName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def handler(event, context):
+              # Initialize CloudFormation client
+              cf_client = boto3.client('cloudformation')
+              
+              # Retrieve the stack name and exported value name from the event
+              stack_name = os.environ.get('StackName')
+              exported_value_name = 'InstanceId'
+              
+              try:
+                  # Describe stack
+                  response = cf_client.describe_stacks(StackName=stack_name)
+                  stack = response['Stacks'][0]
+                  
+                  # Extract exported value from stack outputs
+                  outputs = stack.get('Outputs', [])
+                  for output in outputs:
+                      if output['OutputKey'] == exported_value_name:
+                          instance_id = output['OutputValue']
+                          
+                          # Initialize EC2 client
+                          ec2_client = boto3.client('ec2')
+                          
+                          # Describe instance status
+                          instance_status = ec2_client.describe_instance_status(InstanceIds=[instance_id])
+                          
+                          # Extract instance state
+                          if instance_status['InstanceStatuses']:
+                              state = instance_status['InstanceStatuses'][0]['InstanceState']['Name']
+                              return f"Instance ID: {instance_id}, State: {state}"
+                          else:
+                              return f"Instance is not running for instance ID: {instance_id}"
+                  
+                  return 'Exported value not found'
+              
+              except Exception as e:
+                  return f'Error retrieving exported value: {str(e)}'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                Resource: "*"
+
+Outputs:
+  WebsiteURL:
+    Description: URL of the website
+    Value: !Sub http://${WebServer.PublicDnsName}
+    Export:
+      Name: WebsiteURL
+
+  InstanceId:
+    Description: Instance ID of the created EC2 instance
+    Value: !Ref WebServer
+    Export:
+      Name: InstanceId
+
+  SecurityGroupId:
+    Description: ID of the created security group
+    Value: !GetAtt SecurityGroup.GroupId
+    Export:
+      Name: SecurityGroupId
+
+  LambdaArn:
+    Description: ARN of created Lambda Function
+    Value: !GetAtt CheckInstanceStatusFunction.Arn
+    Export:
+      Name: LambdaArn
